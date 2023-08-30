@@ -124,6 +124,16 @@ class RaySamples(TensorDataclass):
     times: Optional[TensorType[..., 1]] = None
     """Times at which rays are sampled"""
 
+    def __getstate__(self):
+        """Get state for pickling"""
+        state = self.__dict__.copy()
+        del state['spacing_to_euclidean_fn']
+        return state
+    
+    def __setstate__(self, state):
+        """Set state for unpickling"""
+        self.__dict__.update(state)
+
     def get_weights(self, densities: TensorType[..., "num_samples", 1]) -> TensorType[..., "num_samples", 1]:
         """Return weights based on predicted densities
 

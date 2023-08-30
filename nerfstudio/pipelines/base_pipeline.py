@@ -250,7 +250,7 @@ class VanillaPipeline(Pipeline):
 
         self._model = config.model.setup(
             scene_box=self.datamanager.train_dataset.scene_box,
-            num_train_data=len(self.datamanager.train_dataset),
+            num_train_data= self.config.datamanager.train_num_images_to_sample_from if self.config.datamanager.train_num_images_to_sample_from > 0 else len(self.datamanager.train_dataset),
             metadata=self.datamanager.train_dataset.metadata,
         )
         self.model.to(device)

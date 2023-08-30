@@ -89,6 +89,7 @@ class Nerfstudio(DataParser):
         mask_filenames = []
         depth_filenames = []
         poses = []
+        times = []
         num_skipped_image_filenames = 0
 
         fx_fixed = "fl_x" in meta
@@ -149,6 +150,8 @@ class Nerfstudio(DataParser):
 
             image_filenames.append(fname)
             poses.append(np.array(frame["transform_matrix"]))
+            if "time" in frame:
+                times.append(frame["time"])
             if "mask_path" in frame:
                 mask_filepath = PurePath(frame["mask_path"])
                 mask_fname = self._get_fname(
@@ -183,6 +186,11 @@ class Nerfstudio(DataParser):
         Different number of image and depth filenames.
         You should check that depth_file_path is specified for every frame (or zero frames) in transforms.json.
         """
+        assert len(times) == 0 or (
+            len(times) == len(image_filenames)
+        ),"""
+        Either every image should have a time, or none of them should.
+        You should check that time is specified for every frame (or zero frames) in transforms.json."""
 
         has_split_files_spec = any(f"{split}_filenames" in meta for split in ("train", "val", "test"))
         if f"{split}_filenames" in meta:
@@ -263,6 +271,7 @@ class Nerfstudio(DataParser):
         cy = float(meta["cy"]) if cy_fixed else torch.tensor(cy, dtype=torch.float32)[idx_tensor]
         height = int(meta["h"]) if height_fixed else torch.tensor(height, dtype=torch.int32)[idx_tensor]
         width = int(meta["w"]) if width_fixed else torch.tensor(width, dtype=torch.int32)[idx_tensor]
+        times = torch.tensor(times, dtype=torch.float32)[idx_tensor]
         if distort_fixed:
             distortion_params = camera_utils.get_distortion_params(
                 k1=float(meta["k1"]) if "k1" in meta else 0.0,
@@ -285,6 +294,7 @@ class Nerfstudio(DataParser):
             width=width,
             camera_to_worlds=poses[:, :3, :4],
             camera_type=camera_type,
+            times=times,
         )
 
         assert self.downscale_factor is not None

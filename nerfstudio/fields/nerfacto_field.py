@@ -104,6 +104,12 @@ class TCNNNerfactoField(Field):
         use_pred_normals: bool = False,
         use_average_appearance_embedding: bool = False,
         spatial_distortion: SpatialDistortion = None,
+        use_scene_embedding: bool = False,
+        scene_embedding_distortion: bool = False,
+        scene_embedding_dim: Optional[int] = None,
+        num_scenes: Optional[int] = None,
+        num_layers_scenes: Optional[int] = None,
+        hidden_dim_scenes: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -118,6 +124,7 @@ class TCNNNerfactoField(Field):
         self.num_images = num_images
         self.appearance_embedding_dim = appearance_embedding_dim
         self.embedding_appearance = Embedding(self.num_images, self.appearance_embedding_dim)
+        
         self.use_average_appearance_embedding = use_average_appearance_embedding
         self.use_transient_embedding = use_transient_embedding
         self.use_semantics = use_semantics
@@ -161,6 +168,48 @@ class TCNNNerfactoField(Field):
             },
         )
 
+        # scenes
+        self.scene_density_mlp = None
+        self.scene_distortion_mlp = None
+        self.use_scene_embedding = use_scene_embedding
+        self.scene_embedding_distortion = scene_embedding_distortion
+        if(self.use_scene_embedding):
+            assert scene_embedding_dim is not None and num_scenes is not None
+            self.num_scenes = num_scenes
+            self.scene_embedding_dim = scene_embedding_dim
+            self.embedding_scene = Embedding(self.num_scenes, scene_embedding_dim)
+
+            self.scene_density_mlp = tcnn.Network(
+                n_input_dims=1 + self.geo_feat_dim + scene_embedding_dim,
+                n_output_dims=1 + self.geo_feat_dim,
+                network_config={
+                    "otype": "FullyFusedMLP",
+                    "activation": "ReLU",
+                    "output_activation": "None",
+                    "n_neurons": hidden_dim_scenes,
+                    "n_hidden_layers": num_layers_scenes - 1,
+                },
+            )
+
+            self.scene_distortion_mlp = tcnn.NetworkWithInputEncoding(
+                n_input_dims=3,
+                n_output_dims=3 * self.num_scenes,
+                encoding_config={
+                "otype": "HashGrid",
+                "n_levels": num_levels,
+                "n_features_per_level": features_per_level,
+                "log2_hashmap_size": log2_hashmap_size,
+                "base_resolution": base_res,
+                "per_level_scale": growth_factor,
+                },
+                network_config={
+                    "otype": "FullyFusedMLP",
+                    "activation": "ReLU",
+                    "output_activation": "None",
+                    "n_neurons": hidden_dim,
+                    "n_hidden_layers": num_layers - 1,
+                },
+            )
         # transients
         if self.use_transient_embedding:
             self.transient_embedding_dim = transient_embedding_dim
@@ -212,8 +261,11 @@ class TCNNNerfactoField(Field):
             )
             self.field_head_pred_normals = PredNormalsFieldHead(in_dim=self.mlp_pred_normals.n_output_dims)
 
+
+        mlp_head_input_dims = self.direction_encoding.n_output_dims + self.geo_feat_dim + self.appearance_embedding_dim
+
         self.mlp_head = tcnn.Network(
-            n_input_dims=self.direction_encoding.n_output_dims + self.geo_feat_dim + self.appearance_embedding_dim,
+            n_input_dims=mlp_head_input_dims,
             n_output_dims=3,
             network_config={
                 "otype": "FullyFusedMLP",
@@ -232,14 +284,47 @@ class TCNNNerfactoField(Field):
             positions = (positions + 2.0) / 4.0
         else:
             positions = SceneBox.get_normalized_positions(ray_samples.frustums.get_positions(), self.aabb)
+        
         # Make sure the tcnn gets inputs between 0 and 1.
         selector = ((positions > 0.0) & (positions < 1.0)).all(dim=-1)
         positions = positions * selector[..., None]
         self._sample_locations = positions
         if not self._sample_locations.requires_grad:
             self._sample_locations.requires_grad = True
+        
         positions_flat = positions.view(-1, 3)
-        h = self.mlp_base(positions_flat).view(*ray_samples.frustums.shape, -1)
+
+        # if we use scene embedding:
+        #  if we are using the distortion MLP, then run through that and then proceed to the normal base
+        #  otherwise, compute the scene embedding and append to input, then run the scene mlp
+        if(self.use_scene_embedding):
+            if(self.scene_embedding_distortion):
+                # positions flat: (N, 3)
+                # scenes_positions_flat: (N, 3 * num_scenes)
+                scenes_positions_flat = self.scene_distortion_mlp(positions_flat)
+                # need to index into scene_positions_flat based on ray_samples_times
+                scenes_positions = scenes_positions_flat.view(-1, self.num_scenes, 3)
+                time_indices = ray_samples.times.to(dtype=torch.long)
+                positions_flat = scenes_positions[torch.arange(scenes_positions.shape[0]), time_indices.view(-1)].view(-1, 3)
+                h = self.mlp_base(positions_flat).view(*ray_samples.frustums.shape, -1)
+                
+            else:
+                h = self.mlp_base(positions_flat).view(*ray_samples.frustums.shape, -1)
+                # TODO: update the scene indices to come from the datamanager/parser as ints
+                # instead of converting them here in the forward call
+                times = ray_samples.times.to(dtype=torch.int)
+                scene_embeddings = self.embedding_scene(times)
+                # we want the scene_embeddings when we are at time 0 to be zero
+                times = times.repeat(1, 1, self.scene_embedding_dim).unsqueeze(-2)
+                scene_embeddings[times == 0] *= 0.0
+
+                scene_embeddings = scene_embeddings.view((h.shape[0:-1] + (self.scene_embedding_dim,)))
+                
+                scene_inputs_flat = torch.cat([h, scene_embeddings], dim=-1).view(-1, 1 + self.geo_feat_dim + self.scene_embedding_dim)
+                h = self.scene_density_mlp(scene_inputs_flat).view(*ray_samples.frustums.shape, -1)
+        else:
+            h = self.mlp_base(positions_flat).view(*ray_samples.frustums.shape, -1)
+
         density_before_activation, base_mlp_out = torch.split(h, [1, self.geo_feat_dim], dim=-1)
         self._density_before_activation = density_before_activation
 
