@@ -45,6 +45,7 @@ class HashMLPDensityField(Field):
         hidden_dim: dimension of hidden layers
         spatial_distortion: spatial distortion module
         use_linear: whether to skip the MLP and use a single linear layer instead
+        use_time: whether to use time as an input to the density field
     """
 
     def __init__(
@@ -54,6 +55,8 @@ class HashMLPDensityField(Field):
         hidden_dim: int = 64,
         spatial_distortion: Optional[SpatialDistortion] = None,
         use_linear: bool = False,
+        use_time: bool = False,
+        time_enc_frequencies: int = 2,
         num_levels: int = 8,
         max_res: int = 1024,
         base_res: int = 16,
@@ -64,6 +67,7 @@ class HashMLPDensityField(Field):
         self.register_buffer("aabb", aabb)
         self.spatial_distortion = spatial_distortion
         self.use_linear = use_linear
+        self.use_time = use_time
         growth_factor = np.exp((np.log(max_res) - np.log(base_res)) / (num_levels - 1))
 
         self.register_buffer("max_res", torch.tensor(max_res))
@@ -72,12 +76,27 @@ class HashMLPDensityField(Field):
 
         config = {
             "encoding": {
-                "otype": "HashGrid",
-                "n_levels": num_levels,
-                "n_features_per_level": features_per_level,
-                "log2_hashmap_size": log2_hashmap_size,
-                "base_resolution": base_res,
-                "per_level_scale": growth_factor,
+                "otype": "Composite",
+                "nested": [
+                    {
+                        "n_dims_to_encode": 3,
+                        "otype": "HashGrid",
+                        "n_levels": num_levels,
+                        "n_features_per_level": features_per_level,
+                        "log2_hashmap_size": log2_hashmap_size,
+                        "base_resolution": base_res,
+                        "per_level_scale": growth_factor,
+                    },
+                    {
+                        "n_dims_to_encode": 1,
+                        "otype": "Frequency",
+                        "n_frequencies": time_enc_frequencies
+                    },
+                    {
+                        "otype": "Identity"
+                    }
+                ]
+                
             },
             "network": {
                 "otype": "FullyFusedMLP",
@@ -88,18 +107,21 @@ class HashMLPDensityField(Field):
             },
         }
 
+        additional_input_dims = 1 if use_time else 0
+
         if not self.use_linear:
             self.mlp_base = tcnn.NetworkWithInputEncoding(
-                n_input_dims=3,
+                n_input_dims=3 + additional_input_dims,
                 n_output_dims=1,
                 encoding_config=config["encoding"],
                 network_config=config["network"],
             )
         else:
-            self.encoding = tcnn.Encoding(n_input_dims=3, encoding_config=config["encoding"])
+            self.encoding = tcnn.Encoding(n_input_dims=3 + additional_input_dims, encoding_config=config["encoding"])
             self.linear = torch.nn.Linear(self.encoding.n_output_dims, 1)
 
     def get_density(self, ray_samples: RaySamples) -> Tuple[TensorType, None]:
+
         if self.spatial_distortion is not None:
             positions = self.spatial_distortion(ray_samples.frustums.get_positions())
             positions = (positions + 2.0) / 4.0
@@ -108,13 +130,22 @@ class HashMLPDensityField(Field):
         # Make sure the tcnn gets inputs between 0 and 1.
         selector = ((positions > 0.0) & (positions < 1.0)).all(dim=-1)
         positions = positions * selector[..., None]
+        times = ray_samples.times * selector[..., None]
+
         positions_flat = positions.view(-1, 3)
         if not self.use_linear:
+            if self.use_time:
+                x = torch.cat([positions_flat, times.view(-1, 1).to(positions_flat)], dim=-1)
+            else:
+                x = positions_flat
+            
             density_before_activation = (
-                self.mlp_base(positions_flat).view(*ray_samples.frustums.shape, -1).to(positions)
+                self.mlp_base(x).view(*ray_samples.frustums.shape, -1).to(positions)
             )
         else:
             x = self.encoding(positions_flat).to(positions)
+            if self.use_time:
+                x = torch.cat([x, times.view(-1, 1).to(x)], dim=-1)
             density_before_activation = self.linear(x).view(*ray_samples.frustums.shape, -1)
 
         # Rectifying the density with an exponential is much more stable than a ReLU or

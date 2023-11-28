@@ -29,7 +29,10 @@ from torch.utils.data import Dataset
 from torchtyping import TensorType
 
 from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
-from nerfstudio.data.utils.data_utils import get_image_mask_tensor_from_path
+from nerfstudio.data.utils.data_utils import (
+    get_image_mask_tensor_from_path,
+    get_semantics_and_mask_tensors_from_path,
+)
 
 
 class InputDataset(Dataset):
@@ -44,6 +47,7 @@ class InputDataset(Dataset):
         super().__init__()
         self._dataparser_outputs = dataparser_outputs
         self.has_masks = dataparser_outputs.mask_filenames is not None
+        self.has_semantics = dataparser_outputs.label_filenames is not None
         self.scale_factor = scale_factor
         self.scene_box = deepcopy(dataparser_outputs.scene_box)
         self.metadata = deepcopy(dataparser_outputs.metadata)
@@ -52,6 +56,7 @@ class InputDataset(Dataset):
 
     def __len__(self):
         return len(self._dataparser_outputs.image_filenames)
+    
 
     def get_numpy_image(self, image_idx: int) -> npt.NDArray[np.uint8]:
         """Returns the image of shape (H, W, 3 or 4).
@@ -102,6 +107,9 @@ class InputDataset(Dataset):
             assert (
                 data["mask"].shape[:2] == data["image"].shape[:2]
             ), f"Mask and image have different shapes. Got {data['mask'].shape[:2]} and {data['image'].shape[:2]}"
+        if self.has_semantics:
+            semantics_filepath = self._dataparser_outputs.label_filenames[image_idx]
+            data["semantics"], _ = get_semantics_and_mask_tensors_from_path(filepath=semantics_filepath, mask_indices = [], scale_factor=self.scale_factor)
         metadata = self.get_metadata(data)
         data.update(metadata)
         return data

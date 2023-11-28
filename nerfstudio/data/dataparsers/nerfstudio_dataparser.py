@@ -87,6 +87,7 @@ class Nerfstudio(DataParser):
 
         image_filenames = []
         mask_filenames = []
+        label_filenames = []
         depth_filenames = []
         poses = []
         times = []
@@ -160,6 +161,11 @@ class Nerfstudio(DataParser):
                     downsample_folder_prefix="masks_",
                 )
                 mask_filenames.append(mask_fname)
+
+            if "labels_path" in frame:
+                labels_filepath = PurePath(frame["labels_path"])
+                labels_fname = self._get_fname(labels_filepath, data_dir, downsample_folder_prefix="labels_")
+                label_filenames.append(labels_fname)
 
             if "depth_file_path" in frame:
                 depth_filepath = PurePath(frame["depth_file_path"])
@@ -247,6 +253,7 @@ class Nerfstudio(DataParser):
         # Choose image_filenames and poses based on split, but after auto orient and scaling the poses.
         image_filenames = [image_filenames[i] for i in indices]
         mask_filenames = [mask_filenames[i] for i in indices] if len(mask_filenames) > 0 else []
+        label_filenames = [label_filenames[i] for i in indices] if len(label_filenames) > 0 else []
         depth_filenames = [depth_filenames[i] for i in indices] if len(depth_filenames) > 0 else []
         poses = poses[indices]
 
@@ -314,6 +321,7 @@ class Nerfstudio(DataParser):
             cameras=cameras,
             scene_box=scene_box,
             mask_filenames=mask_filenames if len(mask_filenames) > 0 else None,
+            label_filenames=label_filenames if len(label_filenames) > 0 else None,
             dataparser_scale=scale_factor,
             dataparser_transform=transform_matrix,
             metadata={

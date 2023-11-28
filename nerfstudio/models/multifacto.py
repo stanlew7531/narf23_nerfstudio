@@ -55,6 +55,7 @@ from nerfstudio.model_components.renderers import (
     DepthRenderer,
     NormalsRenderer,
     RGBRenderer,
+    SemanticRenderer,
 )
 from nerfstudio.model_components.scene_colliders import NearFarCollider
 from nerfstudio.model_components.shaders import NormalsShader
@@ -119,6 +120,8 @@ class MultifactoModelConfig(ModelConfig):
     """Orientation loss multiplier on computed normals."""
     pred_normal_loss_mult: float = 0.001
     """Predicted normal loss multiplier."""
+    pred_semantics_loss_mult: float = 0.001
+    """Predicted semantics loss multiplier."""
     use_proposal_weight_anneal: bool = True
     """Whether to use proposal weight annealing."""
     use_average_appearance_embedding: bool = True
@@ -131,6 +134,14 @@ class MultifactoModelConfig(ModelConfig):
     """Whether use single jitter or not for the proposal networks."""
     predict_normals: bool = False
     """Whether to predict normals or not."""
+    predict_semantics: bool = False
+    """Whether to predict semantics (class labels) or not."""
+    num_semantic_classes: int = 0
+    """Number of semantic classes."""
+    use_semantic_weights: bool = False
+    """Whether to weight each semantic class seperately or not."""
+    semantic_class_weights: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.01748659912109375, 0.997672626953125, 0.9972161474609375, 0.9979779663085937, 0.9971333219401042, 0.9967517211914062, 0.9978086027018229, 0.9993640812174479, 0.9987498746744792, 0.9999196695963541, 0.9999193888346354])
+    """Weights for each semantic class (if applicable)."""
     disable_scene_contraction: bool = False
     """Whether to disable scene contraction or not."""
     num_scenes: int = 1
@@ -178,6 +189,8 @@ class MultifactoModel(Model):
             hidden_dim_scenes=16,
             num_layers_scenes=2,
             scene_embedding_distortion=self.config.scene_embedding_distortion,
+            use_semantics=self.config.predict_semantics,
+            num_semantic_classes=self.config.num_semantic_classes,
         )
 
         self.density_fns = []
@@ -187,7 +200,7 @@ class MultifactoModel(Model):
         if self.config.use_same_proposal_network:
             assert len(self.config.proposal_net_args_list) == 1, "Only one proposal network is allowed."
             prop_net_args = self.config.proposal_net_args_list[0]
-            network = HashMLPDensityField(self.scene_box.aabb, spatial_distortion=scene_contraction, **prop_net_args)
+            network = HashMLPDensityField(self.scene_box.aabb, spatial_distortion=scene_contraction, use_time=True, **prop_net_args)
             self.proposal_networks.append(network)
             self.density_fns.extend([network.density_fn for _ in range(num_prop_nets)])
         else:
@@ -196,6 +209,7 @@ class MultifactoModel(Model):
                 network = HashMLPDensityField(
                     self.scene_box.aabb,
                     spatial_distortion=scene_contraction,
+                    use_time=True,
                     **prop_net_args,
                 )
                 self.proposal_networks.append(network)
@@ -230,12 +244,20 @@ class MultifactoModel(Model):
         self.renderer_accumulation = AccumulationRenderer()
         self.renderer_depth = DepthRenderer()
         self.renderer_normals = NormalsRenderer()
+        self.renderer_semantics = SemanticRenderer()
 
         # shaders
         self.normals_shader = NormalsShader()
 
         # losses
         self.rgb_loss = MSELoss()
+        weight = None
+        if self.config.use_semantic_weights:
+            weight = torch.Tensor(self.config.semantic_class_weights)
+        self.cross_entropy_loss = torch.nn.CrossEntropyLoss(
+            weight = weight,
+            reduction="mean"
+        )
 
         # metrics
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
@@ -301,6 +323,14 @@ class MultifactoModel(Model):
             pred_normals = self.renderer_normals(field_outputs[FieldHeadNames.PRED_NORMALS], weights=weights)
             outputs["normals"] = self.normals_shader(normals)
             outputs["pred_normals"] = self.normals_shader(pred_normals)
+
+        if self.config.predict_semantics:
+            semantics = self.renderer_semantics(
+                semantics=field_outputs[FieldHeadNames.SEMANTICS],
+                weights=weights,
+            )
+            outputs["semantics"] = semantics
+
         # These use a lot of GPU memory, so we avoid storing them for eval.
         if self.training:
             outputs["weights_list"] = weights_list
@@ -332,8 +362,15 @@ class MultifactoModel(Model):
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
         loss_dict = {}
+
         image = batch["image"].to(self.device)
         loss_dict["rgb_loss"] = self.rgb_loss(image, outputs["rgb"])
+
+        if(self.config.predict_semantics):
+            semantics = batch["semantics"].to(self.device)
+            loss_dict["semantics_loss"] = self.config.pred_semantics_loss_mult * \
+                self.cross_entropy_loss(outputs["semantics"], semantics.squeeze())
+
         if self.training:
             loss_dict["interlevel_loss"] = self.config.interlevel_loss_mult * interlevel_loss(
                 outputs["weights_list"], outputs["ray_samples_list"]
@@ -356,6 +393,15 @@ class MultifactoModel(Model):
         self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
         image = batch["image"].to(self.device)
+
+        if(self.config.predict_semantics):
+            semantics = colormaps.apply_colormap((batch["semantics"] / self.config.num_semantic_classes).to(self.device))
+            inferred_semantics = outputs["semantics"].max(dim=-1)[1].unsqueeze(-1)
+            semantic_pred = colormaps.apply_colormap(
+                (inferred_semantics / float(self.config.num_semantic_classes)).to(self.device)
+            )
+            combined_semantics = torch.cat([semantics, semantic_pred], dim=1)
+
         rgb = outputs["rgb"]
         acc = colormaps.apply_colormap(outputs["accumulation"])
         depth = colormaps.apply_depth_colormap(
@@ -380,6 +426,9 @@ class MultifactoModel(Model):
         metrics_dict["lpips"] = float(lpips)
 
         images_dict = {"img": combined_rgb, "accumulation": combined_acc, "depth": combined_depth}
+
+        if(self.config.predict_semantics):
+            images_dict["semantics"] = combined_semantics
 
         for i in range(self.config.num_proposal_iterations):
             key = f"prop_depth_{i}"

@@ -45,7 +45,7 @@ class Field(nn.Module):
         self._sample_locations = None
         self._density_before_activation = None
 
-    def density_fn(self, positions: TensorType["bs":..., 3]) -> TensorType["bs":..., 1]:
+    def density_fn(self, positions: TensorType["bs":..., 3], times: Optional[TensorType] = None) -> TensorType["bs":..., 1]:
         """Returns only the density. Used primarily with the density grid.
 
         Args:
@@ -58,8 +58,9 @@ class Field(nn.Module):
                 directions=torch.ones_like(positions),
                 starts=torch.zeros_like(positions[..., :1]),
                 ends=torch.zeros_like(positions[..., :1]),
-                pixel_area=torch.ones_like(positions[..., :1]),
-            )
+                pixel_area=torch.ones_like(positions[..., :1])
+            ),
+            times=times,
         )
         density, _ = self.get_density(ray_samples)
         return density
