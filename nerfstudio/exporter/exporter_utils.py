@@ -95,6 +95,7 @@ def generate_point_cloud(
     bounding_box_min: Tuple[float, float, float] = (-1.0, -1.0, -1.0),
     bounding_box_max: Tuple[float, float, float] = (1.0, 1.0, 1.0),
     std_ratio: float = 10.0,
+    cloud_time: Optional[float] = None,
 ) -> o3d.geometry.PointCloud:
     """Generate a point cloud from a nerf.
 
@@ -126,11 +127,21 @@ def generate_point_cloud(
     points = []
     rgbs = []
     normals = []
+    part_labels = []
+
     with progress as progress_bar:
         task = progress_bar.add_task("Generating Point Cloud", total=num_points)
         while not progress_bar.finished:
             with torch.no_grad():
-                ray_bundle, _ = pipeline.datamanager.next_train(0)
+                ray_bundle, batch = pipeline.datamanager.next_train(0)
+                # print(batch["semantics"].shape)
+                gt_semantics = None
+                if("semantics" in batch):
+                    gt_semantics = batch["semantics"]
+                if(cloud_time is not None):
+                    mask = (ray_bundle.times == cloud_time).squeeze()
+                    ray_bundle = ray_bundle[mask]
+                    gt_semantics = gt_semantics[mask]
                 outputs = pipeline.model(ray_bundle)
             if rgb_output_name not in outputs:
                 CONSOLE.rule("Error", style="red")
@@ -144,6 +155,7 @@ def generate_point_cloud(
                 sys.exit(1)
             rgb = outputs[rgb_output_name]
             depth = outputs[depth_output_name]
+            semantics = gt_semantics
             if normal_output_name is not None:
                 if normal_output_name not in outputs:
                     CONSOLE.rule("Error", style="red")
@@ -166,25 +178,29 @@ def generate_point_cloud(
                 mask = torch.all(torch.concat([point > comp_l, point < comp_m], dim=-1), dim=-1)
                 point = point[mask]
                 rgb = rgb[mask]
+                if "semantics" in batch:
+                    semantics = semantics[mask]
                 if normal_output_name is not None:
                     normal = normal[mask]
 
             points.append(point)
             rgbs.append(rgb)
+            part_labels.append(semantics)
             if normal_output_name is not None:
                 normals.append(normal)
             progress.advance(task, point.shape[0])
     points = torch.cat(points, dim=0)
     rgbs = torch.cat(rgbs, dim=0)
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points.double().cpu().numpy())
-    pcd.colors = o3d.utility.Vector3dVector(rgbs.double().cpu().numpy())
+    part_labels = torch.cat(part_labels, dim=0).squeeze()
+    pcd = o3d.t.geometry.PointCloud()
+    pcd.point.positions = o3d.core.Tensor(points.float().cpu().numpy())
+    pcd.point.colors = o3d.core.Tensor(rgbs.float().cpu().numpy())
+    pcd.point.labels = o3d.core.Tensor(part_labels.int().cpu().numpy())
 
     ind = None
     if remove_outliers:
         CONSOLE.print("Cleaning Point Cloud")
-        pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=std_ratio)
+        pcd, ind = pcd.remove_statistical_outliers(nb_neighbors=20, std_ratio=std_ratio)
         print("\033[A\033[A")
         CONSOLE.print("[bold green]:white_check_mark: Cleaning Point Cloud")
 
